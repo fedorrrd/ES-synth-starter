@@ -1,9 +1,10 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <bitset>
+#include <STM32FreeRTOS.h>
 
 HardwareTimer sampleTimer(TIM1);
-std::bitset<32> inputs;
+// std::bitset<32> inputs;
 
 // Constants
 const uint32_t interval = 100;                                                                                                                         // Display update interval
@@ -15,10 +16,12 @@ const std::string notes[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A
 volatile uint32_t currentStepSize;
 volatile uint32_t localCurrentStepSize;
 
-//struct to store variables between threads
-struct {
-  std::bitset<32> inputs;  
-  } sysState;
+// struct to store variables between threads
+struct
+{
+  std::bitset<32> inputs;
+  bool keypress = false;
+} sysState;
 
 // Pin definitions
 // Row select and enable
@@ -95,46 +98,74 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value)
   digitalWrite(REN_PIN, LOW);
 }
 
-void scanKeysTask(void * pvParameters) {
-  for (int i = 0; i < 3; i++)
+void scanKeysTask(void *pvParameters)
+{
+  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (true)
   {
-    setRow(i);
-    delayMicroseconds(3);
-    std::bitset<4> input_iteration = readCols();
-    for (int j = 0; j < 4; j++)
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    for (int i = 0; i < 3; i++)
     {
-      sysState.inputs[i * 4 + j] = input_iteration[j];
+      setRow(i);
+      delayMicroseconds(3);
+      std::bitset<4> input_iteration = readCols();
+      for (int j = 0; j < 4; j++)
+      {
+        sysState.inputs[i * 4 + j] = input_iteration[j];
+      }
     }
-  }
 
-  bool keypress = false;
+    sysState.keypress = false;
 
-  for (int i = 0; i < 12; i++)
-  {
-    if (sysState.inputs[i] == 0)
+    for (int i = 0; i < 12; i++)
     {
-      localCurrentStepSize = stepSizes[i];
+      if (sysState.inputs[i] == 0)
+      {
+        localCurrentStepSize = stepSizes[i];
+        sysState.keypress = true;
+      }
+    }
+
+    if (!sysState.keypress)
+    {
+      localCurrentStepSize = 0;
+    }
+    __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+    // Toggle LED
+    digitalToggle(LED_BUILTIN);
+  }
+}
+
+void displayUpdateTask(void *pvParameters)
+{
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (true)
+  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    sysState.keypress = false;
+
+    for (int i = 0; i < 12; i++)
+    {
+      if (sysState.inputs[i] == 0)
+      {
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawStr(2, 10, notes[i].c_str());
+        u8g2.sendBuffer();
+        sysState.keypress = true;
+      }
+    }
+
+    if (!sysState.keypress)
+    {
       u8g2.clearBuffer();
       u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(2, 10, notes[i].c_str());
+      u8g2.drawStr(2, 10, "nothing");
       u8g2.sendBuffer();
-      keypress = true;
     }
   }
-
-  if (!keypress)
-  {
-    localCurrentStepSize = 0;
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(2, 10, "no keypress");
-    u8g2.sendBuffer();
-  }
-
-  __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
-
-  // Toggle LED
-  digitalToggle(LED_BUILTIN);
 }
 
 void setup()
@@ -173,6 +204,26 @@ void setup()
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
+
+  TaskHandle_t scanKeysHandle = NULL;
+  xTaskCreate(
+      scanKeysTask,     /* Function that implements the task */
+      "scanKeys",       /* Text name for the task */
+      64,               /* Stack size in words, not bytes */
+      NULL,             /* Parameter passed into the task */
+      2,                /* Task priority */
+      &scanKeysHandle); /* Pointer to store the task handle */
+
+  TaskHandle_t displayUpdateHandle = NULL;
+  xTaskCreate(
+      displayUpdateTask,     /* Function that implements the task */
+      "scanKeys",            /* Text name for the task */
+      256,                   /* Stack size in words, not bytes */
+      NULL,                  /* Parameter passed into the task */
+      1,                     /* Task priority */
+      &displayUpdateHandle); /* Pointer to store the task handle */
+
+  vTaskStartScheduler();
 }
 
 void loop()
@@ -185,6 +236,4 @@ void loop()
     ; // Wait for next interval
 
   next += interval;
-
-  scanKeysTask(NULL);
 }
