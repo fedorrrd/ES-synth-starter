@@ -20,7 +20,7 @@ volatile uint32_t localCurrentStepSize;
 struct
 {
   std::bitset<32> inputs;
-  bool keypress = false;
+  SemaphoreHandle_t mutex;
 } sysState;
 
 // Pin definitions
@@ -112,22 +112,26 @@ void scanKeysTask(void *pvParameters)
       std::bitset<4> input_iteration = readCols();
       for (int j = 0; j < 4; j++)
       {
+        xSemaphoreTake(sysState.mutex, portMAX_DELAY);
         sysState.inputs[i * 4 + j] = input_iteration[j];
+        xSemaphoreGive(sysState.mutex);
       }
     }
 
-    sysState.keypress = false;
+    bool keypress = false;
 
     for (int i = 0; i < 12; i++)
     {
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       if (sysState.inputs[i] == 0)
       {
         localCurrentStepSize = stepSizes[i];
-        sysState.keypress = true;
+        keypress = true;
       }
+      xSemaphoreGive(sysState.mutex);
     }
 
-    if (!sysState.keypress)
+    if (!keypress)
     {
       localCurrentStepSize = 0;
     }
@@ -144,21 +148,23 @@ void displayUpdateTask(void *pvParameters)
   while (true)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    sysState.keypress = false;
+    bool keypress = false;
 
     for (int i = 0; i < 12; i++)
     {
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       if (sysState.inputs[i] == 0)
       {
         u8g2.clearBuffer();
         u8g2.setFont(u8g2_font_ncenB08_tr);
         u8g2.drawStr(2, 10, notes[i].c_str());
         u8g2.sendBuffer();
-        sysState.keypress = true;
+        keypress = true;
       }
+      xSemaphoreGive(sysState.mutex);
     }
 
-    if (!sysState.keypress)
+    if (!keypress)
     {
       u8g2.clearBuffer();
       u8g2.setFont(u8g2_font_ncenB08_tr);
@@ -204,6 +210,8 @@ void setup()
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
+
+  sysState.mutex = xSemaphoreCreateMutex();
 
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(
