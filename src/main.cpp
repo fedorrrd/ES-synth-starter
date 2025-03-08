@@ -20,7 +20,10 @@ volatile uint32_t localCurrentStepSize;
 struct
 {
   std::bitset<32> inputs;
+  std::bitset<32> previousInputs;
+  int knobRotation[4] = {0, 0, 0, 0};
   SemaphoreHandle_t mutex;
+
 } sysState;
 
 // Pin definitions
@@ -100,42 +103,76 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value)
 
 void scanKeysTask(void *pvParameters)
 {
-  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   while (true)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    for (int i = 0; i < 3; i++)
+    // make placeholder for inputs
+    std::bitset<32> inputs;
+
+    // read all inputs
+    bool keypress = false;
+    for (int i = 0; i < 8; i++)
     {
       setRow(i);
       delayMicroseconds(3);
       std::bitset<4> input_iteration = readCols();
       for (int j = 0; j < 4; j++)
       {
-        xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-        sysState.inputs[i * 4 + j] = input_iteration[j];
-        xSemaphoreGive(sysState.mutex);
+        inputs[i * 4 + j] = input_iteration[j];
+        // if input is a key - change current step size
+        if (i < 3)
+        {
+          if (inputs[i * 4 + j] == 0)
+          {
+            localCurrentStepSize = stepSizes[i * 4 + j];
+            keypress = true;
+          }
+        }
       }
     }
 
-    bool keypress = false;
-
-    for (int i = 0; i < 12; i++)
-    {
-      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-      if (sysState.inputs[i] == 0)
-      {
-        localCurrentStepSize = stepSizes[i];
-        keypress = true;
-      }
-      xSemaphoreGive(sysState.mutex);
-    }
-
+    // if no keys are pressed - reset current step size
     if (!keypress)
     {
       localCurrentStepSize = 0;
     }
     __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+
+    // access systate for previous inputs and current knob rotation values
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    // since sysState.inputs is updated at the end of the code - it stores the input of the previous iteration
+    std::bitset<32> previousInputs = sysState.inputs;
+    int knobRotation[] = {sysState.knobRotation[0], sysState.knobRotation[1], sysState.knobRotation[2], sysState.knobRotation[3]};
+    xSemaphoreGive(sysState.mutex);
+
+    // read knobs' rotation
+    for (int i = 12; i < 20; i += 2)
+    {
+      if ((inputs[i] == 1 && inputs[i + 1] == 0 && previousInputs[i] == 0 && previousInputs[i + 1] == 0) || (inputs[i] == 0 && inputs[i + 1] == 1 && previousInputs[i] == 1 && previousInputs[i + 1] == 1))
+      {
+        knobRotation[(i - 12) / 2] = knobRotation[(i - 12) / 2] + 1;
+      }
+      else if ((inputs[i] == 0 && inputs[i + 1] == 1 && previousInputs[i] == 0 && previousInputs[i + 1] == 0) || (inputs[i] == 1 && inputs[i + 1] == 0 && previousInputs[i] == 1 && previousInputs[i + 1] == 1))
+      {
+        knobRotation[(i - 12) / 2] = knobRotation[(i - 12) / 2] - 1;
+      }
+      else
+      {
+        ;
+      }
+    }
+
+    // store sysState variables
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    sysState.inputs = inputs;
+    for (int i = 0; i < 4; i++)
+    {
+      sysState.knobRotation[i] = knobRotation[i];
+    }
+    xSemaphoreGive(sysState.mutex);
+
     // Toggle LED
     digitalToggle(LED_BUILTIN);
   }
@@ -148,29 +185,45 @@ void displayUpdateTask(void *pvParameters)
   while (true)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    bool keypress = false;
 
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+
+    // access systate
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    std::bitset<32> inputs = sysState.inputs;
+    std::bitset<32> previousInputs = sysState.previousInputs;
+    int knobRotation[] = {sysState.knobRotation[0], sysState.knobRotation[1], sysState.knobRotation[2], sysState.knobRotation[3]};
+    xSemaphoreGive(sysState.mutex);
+
+    bool keypress = false;
     for (int i = 0; i < 12; i++)
     {
-      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-      if (sysState.inputs[i] == 0)
+      if (inputs[i] == 0)
       {
-        u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_ncenB08_tr);
         u8g2.drawStr(2, 10, notes[i].c_str());
-        u8g2.sendBuffer();
         keypress = true;
       }
-      xSemaphoreGive(sysState.mutex);
     }
 
     if (!keypress)
     {
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(2, 10, "nothing");
-      u8g2.sendBuffer();
+      u8g2.drawStr(2, 10, "no keypress");
     }
+
+    u8g2.setCursor(2, 20);
+    u8g2.print(knobRotation[0]);
+    u8g2.print(" ");
+    u8g2.print(knobRotation[1]);
+    u8g2.print(" ");
+    u8g2.print(knobRotation[2]);
+    u8g2.print(" ");
+    u8g2.print(knobRotation[3]);
+
+    u8g2.setCursor(2, 30);
+    u8g2.print(inputs.to_ulong(), HEX);
+
+    u8g2.sendBuffer();
   }
 }
 
