@@ -14,14 +14,13 @@ const std::string notes[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A
 
 // volatiles
 volatile uint32_t currentStepSize;
-volatile uint32_t localCurrentStepSize;
+volatile uint32_t knob3Rotation;
 
 // struct to store variables between threads
 struct
 {
   std::bitset<32> inputs;
-  std::bitset<32> previousInputs;
-  int knobRotation[4] = {0, 0, 0, 0};
+  uint32_t knobRotation[4] = {0, 0, 0, 0};
   SemaphoreHandle_t mutex;
 
 } sysState;
@@ -85,6 +84,7 @@ void sampleISR()
   static uint32_t phaseAcc = 0;
   phaseAcc += currentStepSize;
   int32_t Vout = (phaseAcc >> 24) - 128;
+  Vout = Vout >> (8 - knob3Rotation);
   analogWrite(OUTR_PIN, Vout + 128);
 }
 
@@ -105,6 +105,8 @@ void scanKeysTask(void *pvParameters)
 {
   const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
+  uint32_t localCurrentStepSize = 0;
+  int knobDirection[] = {0, 0, 0, 0};
   while (true)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -144,25 +146,60 @@ void scanKeysTask(void *pvParameters)
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     // since sysState.inputs is updated at the end of the code - it stores the input of the previous iteration
     std::bitset<32> previousInputs = sysState.inputs;
-    int knobRotation[] = {sysState.knobRotation[0], sysState.knobRotation[1], sysState.knobRotation[2], sysState.knobRotation[3]};
+    uint32_t knobRotation[] = {sysState.knobRotation[0], sysState.knobRotation[1], sysState.knobRotation[2], sysState.knobRotation[3]};
     xSemaphoreGive(sysState.mutex);
 
     // read knobs' rotation
     for (int i = 12; i < 20; i += 2)
     {
-      if ((inputs[i] == 1 && inputs[i + 1] == 0 && previousInputs[i] == 0 && previousInputs[i + 1] == 0) || (inputs[i] == 0 && inputs[i + 1] == 1 && previousInputs[i] == 1 && previousInputs[i + 1] == 1))
+      if (previousInputs[i] == 0 && previousInputs[i + 1] == 0)
       {
-        knobRotation[(i - 12) / 2] = knobRotation[(i - 12) / 2] + 1;
+        if ((inputs[i] == 1 && inputs[i + 1] == 0) || (inputs[i] == 1 && inputs[i + 1] == 1 && knobDirection[(i - 12) / 2] == 1))
+        {
+          knobDirection[(i - 12) / 2] = 1;
+        }
+        else if ((inputs[i] == 0 && inputs[i + 1] == 1) || (inputs[i] == 1 && inputs[i + 1] == 1 && knobDirection[(i - 12) / 2] == -1))
+        {
+          knobDirection[(i - 12) / 2] = -1;
+        }
+        else
+        {
+          knobDirection[(i - 12) / 2] = 0;
+        }
       }
-      else if ((inputs[i] == 0 && inputs[i + 1] == 1 && previousInputs[i] == 0 && previousInputs[i + 1] == 0) || (inputs[i] == 1 && inputs[i + 1] == 0 && previousInputs[i] == 1 && previousInputs[i + 1] == 1))
+      else if (previousInputs[i] == 1 && previousInputs[i + 1] == 1)
       {
-        knobRotation[(i - 12) / 2] = knobRotation[(i - 12) / 2] - 1;
+        if ((inputs[i] == 0 && inputs[i + 1] == 1) || (inputs[i] == 0 && inputs[i + 1] == 0 && knobDirection[(i - 12) / 2] == 1))
+        {
+          knobDirection[(i - 12) / 2] = 1;
+        }
+        else if ((inputs[i] == 1 && inputs[i + 1] == 0) || (inputs[i] == 0 && inputs[i + 1] == 0 && knobDirection[(i - 12) / 2] == -1))
+        {
+          knobDirection[(i - 12) / 2] = -1;
+        }
+        else
+        {
+          knobDirection[(i - 12) / 2] = 0;
+        }
       }
       else
       {
-        ;
+        knobDirection[(i - 12) / 2] = 0;
       }
     }
+
+    // adjust the knob value according to the rotation
+    if ((knobRotation[0] == 0 && knobDirection[0] == -1) || (knobRotation[0] == 8 && knobDirection[0] == 1))
+    {
+      knobDirection[0] = 0;
+    }
+    for (int i = 0; i < 4; i++)
+    {
+      knobRotation[i] = knobRotation[i] + knobDirection[i];
+    }
+
+    // volume control
+    __atomic_store_n(&knob3Rotation, knobRotation[0], __ATOMIC_RELAXED);
 
     // store sysState variables
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
@@ -192,8 +229,7 @@ void displayUpdateTask(void *pvParameters)
     // access systate
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     std::bitset<32> inputs = sysState.inputs;
-    std::bitset<32> previousInputs = sysState.previousInputs;
-    int knobRotation[] = {sysState.knobRotation[0], sysState.knobRotation[1], sysState.knobRotation[2], sysState.knobRotation[3]};
+    uint32_t knobRotation[] = {sysState.knobRotation[0], sysState.knobRotation[1], sysState.knobRotation[2], sysState.knobRotation[3]};
     xSemaphoreGive(sysState.mutex);
 
     bool keypress = false;
@@ -270,7 +306,7 @@ void setup()
   xTaskCreate(
       scanKeysTask,     /* Function that implements the task */
       "scanKeys",       /* Text name for the task */
-      64,               /* Stack size in words, not bytes */
+      256,              /* Stack size in words, not bytes */
       NULL,             /* Parameter passed into the task */
       2,                /* Task priority */
       &scanKeysHandle); /* Pointer to store the task handle */
